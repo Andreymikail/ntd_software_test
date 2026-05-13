@@ -1,0 +1,85 @@
+{
+  "Comment": "Battery14 ETL Pipeline — orchestrates Glue ETL job then Iceberg job",
+  "StartAt": "RunETLJob",
+  "States": {
+    "RunETLJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.etl_job_name",
+        "Arguments": {
+          "--SOURCE_BUCKET.$": "$.source_bucket",
+          "--DESTINATION_BUCKET.$": "$.destination_bucket",
+          "--BATTERY_FILE_KEY.$": "$.battery_file_key",
+          "--DEGREES_FILE_KEY.$": "$.degrees_file_key",
+          "--OUTPUT_PREFIX.$": "$.output_prefix"
+        }
+      },
+      "ResultPath": "$.etl_job_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ETLJobFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "RunIcebergJob"
+    },
+
+    "RunIcebergJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.iceberg_job_name",
+        "Arguments": {
+          "--DESTINATION_BUCKET.$": "$.destination_bucket",
+          "--PROCESSED_PREFIX.$": "$.output_prefix",
+          "--GLUE_DATABASE.$": "$.glue_database",
+          "--ICEBERG_TABLE.$": "$.iceberg_table"
+        }
+      },
+      "ResultPath": "$.iceberg_job_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "IcebergJobFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PipelineSucceeded"
+    },
+
+    "PipelineSucceeded": {
+      "Type": "Succeed",
+      "Comment": "Both Glue jobs completed successfully"
+    },
+
+    "ETLJobFailed": {
+      "Type": "Fail",
+      "Error": "ETLJobError",
+      "Cause": "The ETL Glue job failed. Check CloudWatch logs for details."
+    },
+
+    "IcebergJobFailed": {
+      "Type": "Fail",
+      "Error": "IcebergJobError",
+      "Cause": "The Iceberg Glue job failed. Check CloudWatch logs for details."
+    }
+  }
+}

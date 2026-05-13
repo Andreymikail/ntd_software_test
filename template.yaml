@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Battery14 ETL Pipeline — EventBridge → Lambda → Step Functions → Glue Jobs → S3/Iceberg
+
+# ─────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  SourceBucketName:
+    Type: String
+    Default: battery14-source-data
+
+  DestinationBucketName:
+    Type: String
+    Default: battery14-processed-data
+
+  GlueScriptsBucketName:
+    Type: String
+    Default: battery14-glue-scripts
+
+  GlueDatabaseName:
+    Type: String
+    Default: battery14_catalog
+
+  IcebergTableName:
+    Type: String
+    Default: battery14_filtered
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 * * ? *)"    # Daily at 06:00 UTC
+
+# ─────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        STATE_MACHINE_ARN: !Ref ETLStateMachine
+
+# ─────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── S3 Buckets ──────────────────────────────
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${SourceBucketName}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${DestinationBucketName}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+
+  GlueScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${GlueScriptsBucketName}-${Environment}"
+
+  # ── Glue Data Catalog Database ───────────────
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: "Battery14 ETL — Glue Data Catalog database"
+
+  # ── IAM Roles ───────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "battery14-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                Resource: !Ref ETLStateMachine
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "battery14-glue-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub "${SourceBucket.Arn}/*"
+                  - !GetAtt DestinationBucket.Arn
+                  - !Sub "${DestinationBucket.Arn}/*"
+                  - !GetAtt GlueScriptsBucket.Arn
+                  - !Sub "${GlueScriptsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetPartitions
+                  - glue:BatchCreatePartition
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "battery14-sfn-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartGlueJobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # ── Glue Jobs ───────────────────────────────
+  ETLGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "battery14-etl-job-${Environment}"
+      Description: "Reads battery14_df.csv and degrees.csv, filters & transforms, writes Parquet to S3"
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/scripts/etl_job.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-spark-ui": "true"
+        "--SOURCE_BUCKET": !Sub "${SourceBucketName}-${Environment}"
+        "--DESTINATION_BUCKET": !Sub "${DestinationBucketName}-${Environment}"
+        "--BATTERY_FILE_KEY": "raw/battery14_df.csv"
+        "--DEGREES_FILE_KEY": "raw/degrees.csv"
+        "--OUTPUT_PREFIX": "processed/battery14_filtered"
+        "--TempDir": !Sub "s3://${GlueScriptsBucket}/tmp/"
+
+  IcebergGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "battery14-iceberg-job-${Environment}"
+      Description: "Reads processed Parquet and writes an Iceberg table to Glue Data Catalog"
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/scripts/iceberg_job.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--datalake-formats": "iceberg"
+        "--conf": >
+          spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.aws.glue.GlueCatalog
+          --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DestinationBucketName}-${Environment}/iceberg/
+          --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+        "--DESTINATION_BUCKET": !Sub "${DestinationBucketName}-${Environment}"
+        "--PROCESSED_PREFIX": "processed/battery14_filtered"
+        "--GLUE_DATABASE": !Ref GlueDatabaseName
+        "--ICEBERG_TABLE": !Ref IcebergTableName
+        "--TempDir": !Sub "s3://${GlueScriptsBucket}/tmp/"
+
+  # ── Step Functions State Machine ─────────────
+  ETLStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "battery14-etl-statemachine-${Environment}"
+      DefinitionUri: statemachine/etl_pipeline.asl.json
+      DefinitionSubstitutions:
+        ETLGlueJobName: !Ref ETLGlueJob
+        IcebergGlueJobName: !Ref IcebergGlueJob
+      Role: !GetAtt StepFunctionsRole.Arn
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/battery14-etl-${Environment}"
+      RetentionInDays: 14
+
+  # ── Lambda Function ──────────────────────────
+  StartETLFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "battery14-start-etl-${Environment}"
+      CodeUri: lambda/start_etl/
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ETLStateMachine
+      Events:
+        ScheduledTrigger:
+          Type: Schedule
+          Properties:
+            Name: !Sub "battery14-etl-schedule-${Environment}"
+            Description: "Triggers the Battery14 ETL pipeline daily at 06:00 UTC"
+            Schedule: !Ref ScheduleExpression
+            Enabled: true
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/battery14-start-etl-${Environment}"
+      RetentionInDays: 14
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+Outputs:
+  SourceBucketName:
+    Description: "S3 bucket for raw input data"
+    Value: !Ref SourceBucket
+
+  DestinationBucketName:
+    Description: "S3 bucket for processed output data"
+    Value: !Ref DestinationBucket
+
+  GlueScriptsBucketName:
+    Description: "S3 bucket for Glue job scripts"
+    Value: !Ref GlueScriptsBucket
+
+  StateMachineArn:
+    Description: "ARN of the Step Functions state machine"
+    Value: !Ref ETLStateMachine
+
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda trigger function"
+    Value: !GetAtt StartETLFunction.Arn
+
+  GlueDatabaseName:
+    Description: "Glue Data Catalog database name"
+    Value: !Ref GlueDatabase
